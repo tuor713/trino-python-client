@@ -17,6 +17,7 @@ https://www.python.org/dev/peps/pep-0249/ .
 Fetch methods returns rows as a list of lists on purpose to let the caller
 decide to convert then to a list of tuples.
 """
+
 import datetime
 import math
 import uuid
@@ -25,12 +26,7 @@ from decimal import Decimal
 from itertools import islice
 from threading import Lock
 from time import time
-from typing import Any
-from typing import Dict
-from typing import List
-from typing import NamedTuple
-from typing import Optional
-from typing import Union
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -38,22 +34,20 @@ import trino.client
 import trino.exceptions
 import trino.logging
 from trino import constants
-from trino.constants import LENGTH_TYPES
-from trino.constants import PRECISION_TYPES
-from trino.constants import SCALE_TYPES
-from trino.exceptions import DatabaseError
-from trino.exceptions import DataError
-from trino.exceptions import Error
-from trino.exceptions import IntegrityError
-from trino.exceptions import InterfaceError
-from trino.exceptions import InternalError
-from trino.exceptions import NotSupportedError
-from trino.exceptions import OperationalError
-from trino.exceptions import ProgrammingError
-from trino.exceptions import Warning
-from trino.transaction import IsolationLevel
-from trino.transaction import NO_TRANSACTION
-from trino.transaction import Transaction
+from trino.constants import LENGTH_TYPES, PRECISION_TYPES, SCALE_TYPES
+from trino.exceptions import (
+    DatabaseError,
+    DataError,
+    Error,
+    IntegrityError,
+    InterfaceError,
+    InternalError,
+    NotSupportedError,
+    OperationalError,
+    ProgrammingError,
+    Warning,
+)
+from trino.transaction import NO_TRANSACTION, IsolationLevel, Transaction
 
 __all__ = [
     # https://www.python.org/dev/peps/pep-0249/#globals
@@ -88,6 +82,7 @@ class TimeBoundLRUCache:
     """A bounded LRU cache which expires entries after a configured number of seconds.
     Note that expired entries will be evicted only on an attempted access (or through
     the LRU policy)."""
+
     def __init__(self, capacity: int, ttl_seconds: int):
         self.capacity = capacity
         self.ttl_seconds = ttl_seconds
@@ -172,10 +167,15 @@ class Connection:
             encoding = [
                 enc
                 for enc in trino.client.ENCODINGS
-                if (enc.split("+")[1] if "+" in enc else None) not in trino.client.CODECS_UNAVAILABLE
+                if (enc.split("+")[1] if "+" in enc else None)
+                not in trino.client.CODECS_UNAVAILABLE
             ]
 
-        self.host = host if parsed_host.hostname is None else parsed_host.hostname + parsed_host.path
+        self.host = (
+            host
+            if parsed_host.hostname is None
+            else parsed_host.hostname + parsed_host.path
+        )
         self.user = user
         self.source = source
         self.catalog = catalog
@@ -217,10 +217,16 @@ class Connection:
 
         # Infer connection port: `hostname` takes precedence over explicit `port` argument
         # If none is given, use default based on HTTP protocol
-        default_port = constants.DEFAULT_TLS_PORT if self.http_scheme == constants.HTTPS else constants.DEFAULT_PORT
+        default_port = (
+            constants.DEFAULT_TLS_PORT
+            if self.http_scheme == constants.HTTPS
+            else constants.DEFAULT_PORT
+        )
         self.port = (
-            parsed_host.port if parsed_host.port is not None
-            else port if port is not None
+            parsed_host.port
+            if parsed_host.port is not None
+            else port
+            if port is not None
             else default_port
         )
 
@@ -288,7 +294,9 @@ class Connection:
             self.request_timeout,
         )
 
-    def cursor(self, cursor_style: str = "row", legacy_primitive_types: bool = None):
+    def cursor(
+        self, cursor_style: str = "row", legacy_primitive_types: bool = None, **kwargs
+    ):
         """Return a new :py:class:`Cursor` object using the connection."""
         if self.isolation_level != IsolationLevel.AUTOCOMMIT:
             if self.transaction is None:
@@ -301,7 +309,8 @@ class Connection:
         cursor_class = {
             # Add any custom Cursor classes here
             "segment": SegmentCursor,
-            "row": Cursor
+            "prefetching": PrefetchingCursor,
+            "row": Cursor,
         }.get(cursor_style.lower(), Cursor)
 
         return cursor_class(
@@ -311,7 +320,8 @@ class Connection:
                 legacy_primitive_types
                 if legacy_primitive_types is not None
                 else self.legacy_primitive_types
-            )
+            ),
+            **kwargs,
         )
 
     def _use_legacy_prepared_statements(self):
@@ -322,14 +332,17 @@ class Connection:
         if value is None:
             try:
                 query = trino.client.TrinoQuery(
-                    self._create_request(),
-                    query="EXECUTE IMMEDIATE 'SELECT 1'")
+                    self._create_request(), query="EXECUTE IMMEDIATE 'SELECT 1'"
+                )
                 query.execute()
                 value = False
             except Exception as e:
                 logger.warning(
                     "EXECUTE IMMEDIATE not available for %s:%s; defaulting to legacy prepared statements (%s)",
-                    self.host, self.port, e)
+                    self.host,
+                    self.port,
+                    e,
+                )
                 value = True
             must_use_legacy_prepared_statements.put((self.host, self.port), value)
         return value
@@ -367,10 +380,12 @@ class ColumnDescription(NamedTuple):
             column["name"],  # name
             column["type"],  # type_code
             None,  # display_size
-            arguments[0]["value"] if raw_type in LENGTH_TYPES else None,  # internal_size
+            arguments[0]["value"]
+            if raw_type in LENGTH_TYPES
+            else None,  # internal_size
             arguments[0]["value"] if raw_type in PRECISION_TYPES else None,  # precision
             arguments[1]["value"] if raw_type in SCALE_TYPES else None,  # scale
-            None  # null_ok
+            None,  # null_ok
         )
 
 
@@ -382,11 +397,7 @@ class Cursor:
 
     """
 
-    def __init__(
-            self,
-            connection,
-            request,
-            legacy_primitive_types: bool = False):
+    def __init__(self, connection, request, legacy_primitive_types: bool = False):
         if not isinstance(connection, Connection):
             raise ValueError(
                 "connection must be a Connection object: {}".format(type(connection))
@@ -430,9 +441,7 @@ class Cursor:
             return None
 
         # [ (name, type_code, display_size, internal_size, precision, scale, null_ok) ]
-        return [
-            ColumnDescription.from_column(col) for col in self._query.columns
-        ]
+        return [ColumnDescription.from_column(col) for col in self._query.columns]
 
     @property
     def rowcount(self):
@@ -491,17 +500,25 @@ class Cursor:
         :param name: name that will be assigned to the prepared statement.
         """
         sql = f"PREPARE {name} FROM {statement}"
-        query = trino.client.TrinoQuery(self.connection._create_request(), query=sql,
-                                        legacy_primitive_types=self._legacy_primitive_types)
+        query = trino.client.TrinoQuery(
+            self.connection._create_request(),
+            query=sql,
+            legacy_primitive_types=self._legacy_primitive_types,
+        )
         query.execute()
 
-    def _execute_prepared_statement(
-        self,
-        statement_name,
-        params
-    ):
-        sql = 'EXECUTE ' + statement_name + ' USING ' + ','.join(map(self._format_prepared_param, params))
-        return trino.client.TrinoQuery(self._request, query=sql, legacy_primitive_types=self._legacy_primitive_types)
+    def _execute_prepared_statement(self, statement_name, params):
+        sql = (
+            "EXECUTE "
+            + statement_name
+            + " USING "
+            + ",".join(map(self._format_prepared_param, params))
+        )
+        return trino.client.TrinoQuery(
+            self._request,
+            query=sql,
+            legacy_primitive_types=self._legacy_primitive_types,
+        )
 
     def _execute_immediate_statement(self, statement: str, params):
         """
@@ -510,10 +527,17 @@ class Cursor:
         :param statement: sql to be executed.
         :param params: parameters to be bound.
         """
-        sql = "EXECUTE IMMEDIATE '" + statement.replace("'", "''") + \
-              "' USING " + ",".join(map(self._format_prepared_param, params))
+        sql = (
+            "EXECUTE IMMEDIATE '"
+            + statement.replace("'", "''")
+            + "' USING "
+            + ",".join(map(self._format_prepared_param, params))
+        )
         return trino.client.TrinoQuery(
-            self.connection._create_request(), query=sql, legacy_primitive_types=self._legacy_primitive_types)
+            self.connection._create_request(),
+            query=sql,
+            legacy_primitive_types=self._legacy_primitive_types,
+        )
 
     def _format_prepared_param(self, param):
         """
@@ -540,7 +564,7 @@ class Cursor:
             return "DOUBLE '%s'" % param
 
         if isinstance(param, str):
-            return ("'%s'" % param.replace("'", "''"))
+            return "'%s'" % param.replace("'", "''")
 
         if isinstance(param, (bytes, bytearray)):
             return "X'%s'" % param.hex()
@@ -566,27 +590,26 @@ class Cursor:
             time_str = param.strftime("%H:%M:%S.%f")
             # named timezones
             if isinstance(param.tzinfo, ZoneInfo):
-                utc_offset = datetime.datetime.now(tz=param.tzinfo).strftime('%z')
+                utc_offset = datetime.datetime.now(tz=param.tzinfo).strftime("%z")
                 return "TIME '%s %s:%s'" % (time_str, utc_offset[:3], utc_offset[3:])
             # offset-based timezones
-            return "TIME '%s %s'" % (time_str, param.strftime('%Z')[3:])
+            return "TIME '%s %s'" % (time_str, param.strftime("%Z")[3:])
 
         if isinstance(param, datetime.date):
             date_str = param.strftime("%Y-%m-%d")
             return "DATE '%s'" % date_str
 
         if isinstance(param, list):
-            return "ARRAY[%s]" % ','.join(map(self._format_prepared_param, param))
+            return "ARRAY[%s]" % ",".join(map(self._format_prepared_param, param))
 
         if isinstance(param, tuple):
-            return "ROW(%s)" % ','.join(map(self._format_prepared_param, param))
+            return "ROW(%s)" % ",".join(map(self._format_prepared_param, param))
 
         if isinstance(param, dict):
             keys = list(param.keys())
             values = [param[key] for key in keys]
             return "MAP({}, {})".format(
-                self._format_prepared_param(keys),
-                self._format_prepared_param(values)
+                self._format_prepared_param(keys), self._format_prepared_param(values)
             )
 
         if isinstance(param, uuid.UUID):
@@ -595,22 +618,26 @@ class Cursor:
         if isinstance(param, Decimal):
             return "DECIMAL '%s'" % format(param, "f")
 
-        raise trino.exceptions.NotSupportedError("Query parameter of type '%s' is not supported." % type(param))
+        raise trino.exceptions.NotSupportedError(
+            "Query parameter of type '%s' is not supported." % type(param)
+        )
 
     def _deallocate_prepared_statement(self, statement_name: str) -> None:
-        sql = 'DEALLOCATE PREPARE ' + statement_name
-        query = trino.client.TrinoQuery(self.connection._create_request(), query=sql,
-                                        legacy_primitive_types=self._legacy_primitive_types)
+        sql = "DEALLOCATE PREPARE " + statement_name
+        query = trino.client.TrinoQuery(
+            self.connection._create_request(),
+            query=sql,
+            legacy_primitive_types=self._legacy_primitive_types,
+        )
         query.execute()
 
     def _generate_unique_statement_name(self):
-        return 'st_' + uuid.uuid4().hex.replace('-', '')
+        return "st_" + uuid.uuid4().hex.replace("-", "")
 
     def execute(self, operation, params=None):
         if params:
             assert isinstance(params, (list, tuple)), (
-                'params must be a list or tuple containing the query '
-                'parameter values'
+                "params must be a list or tuple containing the query parameter values"
             )
 
             if self.connection._use_legacy_prepared_statements():
@@ -635,8 +662,11 @@ class Cursor:
                 self._iterator = iter(self._query.execute())
 
         else:
-            self._query = trino.client.TrinoQuery(self._request, query=operation,
-                                                  legacy_primitive_types=self._legacy_primitive_types)
+            self._query = trino.client.TrinoQuery(
+                self._request,
+                query=operation,
+                legacy_primitive_types=self._legacy_primitive_types,
+            )
             self._iterator = iter(self._query.execute())
         return self
 
@@ -751,23 +781,68 @@ class Cursor:
 
 
 class SegmentCursor(Cursor):
-    def __init__(
-            self,
-            connection,
-            request,
-            legacy_primitive_types: bool = False):
-        super().__init__(connection, request, legacy_primitive_types=legacy_primitive_types)
+    def __init__(self, connection, request, legacy_primitive_types: bool = False):
+        super().__init__(
+            connection, request, legacy_primitive_types=legacy_primitive_types
+        )
         if self.connection._client_session.encoding is None:
-            raise ValueError("SegmentCursor can only be used if encoding is set on the connection")
+            raise ValueError(
+                "SegmentCursor can only be used if encoding is set on the connection"
+            )
 
     def execute(self, operation, params=None):
         if params:
             # TODO: refactor code to allow for params to be supported
             raise ValueError("params not supported")
 
-        self._query = trino.client.TrinoQuery(self._request, query=operation,
-                                              legacy_primitive_types=self._legacy_primitive_types,
-                                              fetch_mode="segments")
+        self._query = trino.client.TrinoQuery(
+            self._request,
+            query=operation,
+            legacy_primitive_types=self._legacy_primitive_types,
+            fetch_mode="segments",
+        )
+        self._iterator = iter(self._query.execute())
+        return self
+
+
+class PrefetchingCursor(Cursor):
+    """Cursor that prefetches and decodes spooled segments in parallel.
+
+    When the server uses the spooling protocol, segments are fetched and decoded
+    concurrently up to ``max_prefetch_rows`` decoded rows held in memory at once.
+    Falls back to standard row-by-row behaviour when spooling is not available.
+
+    Requires ``encoding`` to be set on the connection (same requirement as
+    :class:`SegmentCursor`).
+    """
+
+    def __init__(
+        self,
+        connection,
+        request,
+        max_prefetch_rows: int = 1_000_000,
+        legacy_primitive_types: bool = False,
+    ):
+        super().__init__(
+            connection, request, legacy_primitive_types=legacy_primitive_types
+        )
+        self._max_prefetch_rows = max_prefetch_rows
+        if self.connection._client_session.encoding is None:
+            raise ValueError(
+                "PrefetchingCursor can only be used if encoding is set on the connection"
+            )
+
+    def execute(self, operation, params=None):
+        if params:
+            raise ValueError("params not supported")
+
+        self._query = trino.client.TrinoQuery(
+            self._request,
+            query=operation,
+            legacy_primitive_types=self._legacy_primitive_types,
+            fetch_mode="prefetching",
+            max_prefetch_rows=self._max_prefetch_rows,
+        )
         self._iterator = iter(self._query.execute())
         return self
 

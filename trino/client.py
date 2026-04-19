@@ -32,6 +32,7 @@ The main interface is :class:`TrinoQuery`: ::
     >> query =  TrinoQuery(request, sql)
     >> rows = list(query.execute())
 """
+
 from __future__ import annotations
 
 import abc
@@ -47,6 +48,7 @@ import threading
 import urllib.parse
 import warnings
 from abc import abstractmethod
+from collections import deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -54,15 +56,7 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from enum import Enum
 from time import sleep
-from typing import Any
-from typing import cast
-from typing import Dict
-from typing import List
-from typing import Literal
-from typing import Optional
-from typing import Tuple
-from typing import TypedDict
-from typing import Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union, cast
 from zoneinfo import ZoneInfo
 
 try:
@@ -78,8 +72,7 @@ except ImportError:
     import json
 
 import requests
-from requests import Response
-from requests import Session
+from requests import Response, Session
 from requests.structures import CaseInsensitiveDict
 
 try:
@@ -91,16 +84,11 @@ else:
 
 
 import trino.logging
-from trino import constants
-from trino import exceptions
+from trino import constants, exceptions
 from trino._version import __version__
 from trino.auth import Authentication
-from trino.exceptions import TrinoExternalError
-from trino.exceptions import TrinoQueryError
-from trino.exceptions import TrinoUserError
-from trino.mapper import RowMapper
-from trino.mapper import RowMapperFactory
-
+from trino.exceptions import TrinoExternalError, TrinoQueryError, TrinoUserError
+from trino.mapper import RowMapper, RowMapperFactory
 
 __all__ = [
     "ClientSession",
@@ -110,15 +98,18 @@ __all__ = [
     "DecodableSegment",
     "SpooledSegment",
     "InlineSegment",
-    "Segment"
+    "Segment",
+    "PrefetchingSegmentIterator",
 ]
 
 logger = trino.logging.get_logger(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
+_prefetch_executor = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) + 4))
 
 
 def close_executor():
     executor.shutdown(wait=True)
+    _prefetch_executor.shutdown(wait=True)
 
 
 atexit.register(close_executor)
@@ -130,7 +121,7 @@ if SOCKS_PROXY:
 else:
     PROXIES = {}
 
-_HEADER_EXTRA_CREDENTIAL_KEY_REGEX = re.compile(r'^\S[^\s=]*$')
+_HEADER_EXTRA_CREDENTIAL_KEY_REGEX = re.compile(r"^\S[^\s=]*$")
 
 ENCODINGS = ["json+zstd", "json+lz4", "json"]
 CODECS_UNAVAILABLE = {}
@@ -214,6 +205,7 @@ class ClientSession:
             self._timezone = timezone
         else:
             from tzlocal import get_localzone_name
+
             self._timezone = get_localzone_name()
         self._encoding = encoding
 
@@ -325,10 +317,12 @@ class ClientSession:
             is_legacy_role_pattern = ROLE_PATTERN.match(role) is not None
             if role in ("NONE", "ALL") or is_legacy_role_pattern:
                 if is_legacy_role_pattern:
-                    warnings.warn(f"A role '{role}' is provided using a legacy format. "
-                                  "Please remove the ROLE{} wrapping. Support for the legacy format might be "
-                                  "removed in a future release.",
-                                  DeprecationWarning)
+                    warnings.warn(
+                        f"A role '{role}' is provided using a legacy format. "
+                        "Please remove the ROLE{} wrapping. Support for the legacy format might be "
+                        "removed in a future release.",
+                        DeprecationWarning,
+                    )
                 formatted_roles[catalog] = role
             else:
                 formatted_roles[catalog] = f"ROLE{{{role}}}"
@@ -348,7 +342,9 @@ def get_header_values(headers: CaseInsensitiveDict[str], header: str) -> List[st
     return [val.strip() for val in headers[header].split(",")]
 
 
-def get_session_property_values(headers: CaseInsensitiveDict[str], header: str) -> List[Tuple[str, str]]:
+def get_session_property_values(
+    headers: CaseInsensitiveDict[str], header: str
+) -> List[Tuple[str, str]]:
     kvs = get_header_values(headers, header)
     return [
         (k.strip(), urllib.parse.unquote_plus(v.strip()))
@@ -356,7 +352,9 @@ def get_session_property_values(headers: CaseInsensitiveDict[str], header: str) 
     ]
 
 
-def get_prepared_statement_values(headers: CaseInsensitiveDict[str], header: str) -> List[Tuple[str, str]]:
+def get_prepared_statement_values(
+    headers: CaseInsensitiveDict[str], header: str
+) -> List[Tuple[str, str]]:
     kvs = get_header_values(headers, header)
     return [
         (k.strip(), urllib.parse.unquote_plus(v.strip()))
@@ -364,7 +362,9 @@ def get_prepared_statement_values(headers: CaseInsensitiveDict[str], header: str
     ]
 
 
-def get_roles_values(headers: CaseInsensitiveDict[str], header: str) -> List[Tuple[str, str]]:
+def get_roles_values(
+    headers: CaseInsensitiveDict[str], header: str
+) -> List[Tuple[str, str]]:
     kvs = get_header_values(headers, header)
     return [
         (k.strip(), urllib.parse.unquote_plus(v.strip()))
@@ -400,7 +400,11 @@ class TrinoStatus:
 
 class _DelayExponential:
     def __init__(
-            self, base=0.1, exponent=2, jitter=True, max_delay=1800  # 100ms  # 30 min
+        self,
+        base=0.1,
+        exponent=2,
+        jitter=True,
+        max_delay=1800,  # 100ms  # 30 min
     ):
         self._base = base
         self._exponent = exponent
@@ -408,7 +412,7 @@ class _DelayExponential:
         self._max_delay = max_delay
 
     def __call__(self, attempt):
-        delay = float(self._base) * (self._exponent ** attempt)
+        delay = float(self._base) * (self._exponent**attempt)
         if self._jitter:
             delay *= random.random()
         delay = min(float(self._max_delay), delay)
@@ -417,7 +421,11 @@ class _DelayExponential:
 
 class _RetryWithExponentialBackoff:
     def __init__(
-            self, base=0.1, exponent=2, jitter=True, max_delay=1800  # 100ms  # 30 min
+        self,
+        base=0.1,
+        exponent=2,
+        jitter=True,
+        max_delay=1800,  # 100ms  # 30 min
     ):
         self._get_delay = _DelayExponential(base, exponent, jitter, max_delay)
 
@@ -491,7 +499,9 @@ class TrinoRequest:
         http_scheme: Optional[str] = None,
         auth: Optional[Authentication] = constants.DEFAULT_AUTH,
         max_attempts: int = MAX_ATTEMPTS,
-        request_timeout: Union[float, Tuple[float, float]] = constants.DEFAULT_REQUEST_TIMEOUT,
+        request_timeout: Union[
+            float, Tuple[float, float]
+        ] = constants.DEFAULT_REQUEST_TIMEOUT,
         handle_retry=_RetryWithExponentialBackoff(),
         verify: bool = True,
     ) -> None:
@@ -552,7 +562,8 @@ class TrinoRequest:
                 encoding = [
                     enc
                     for enc in ENCODINGS
-                    if (enc.split("+")[1] if "+" in enc else None) not in CODECS_UNAVAILABLE
+                    if (enc.split("+")[1] if "+" in enc else None)
+                    not in CODECS_UNAVAILABLE
                 ]
                 headers[constants.HEADER_ENCODING] = ",".join(encoding)
         elif isinstance(self._client_session.encoding, list):
@@ -570,8 +581,13 @@ class TrinoRequest:
                 "{}={}".format(catalog, urllib.parse.quote(str(role)))
                 for catalog, role in self._client_session.roles.items()
             )
-        if self._client_session.client_tags is not None and len(self._client_session.client_tags) > 0:
-            headers[constants.HEADER_CLIENT_TAGS] = ",".join(self._client_session.client_tags)
+        if (
+            self._client_session.client_tags is not None
+            and len(self._client_session.client_tags) > 0
+        ):
+            headers[constants.HEADER_CLIENT_TAGS] = ",".join(
+                self._client_session.client_tags
+            )
 
         headers[constants.HEADER_SESSION] = ",".join(
             # ``name`` must not contain ``=``
@@ -595,19 +611,22 @@ class TrinoRequest:
         transaction_id = self._client_session.transaction_id
         headers[constants.HEADER_TRANSACTION] = transaction_id
 
-        if self._client_session.extra_credential is not None and \
-                len(self._client_session.extra_credential) > 0:
-
+        if (
+            self._client_session.extra_credential is not None
+            and len(self._client_session.extra_credential) > 0
+        ):
             for tup in self._client_session.extra_credential:
                 self._verify_extra_credential(tup)
 
             # HTTP 1.1 section 4.2 combine multiple extra credentials into a
             # comma-separated value
             # extra credential value is encoded per spec (application/x-www-form-urlencoded MIME format)
-            headers[constants.HEADER_EXTRA_CREDENTIAL] = \
-                ", ".join(
-                    [f"{tup[0]}={urllib.parse.quote_plus(str(tup[1]))}"
-                     for tup in self._client_session.extra_credential])
+            headers[constants.HEADER_EXTRA_CREDENTIAL] = ", ".join(
+                [
+                    f"{tup[0]}={urllib.parse.quote_plus(str(tup[1]))}"
+                    for tup in self._client_session.extra_credential
+                ]
+            )
 
         return headers
 
@@ -619,7 +638,8 @@ class TrinoRequest:
             request_timeout=self._request_timeout,
             handle_retry=self._handle_retry,
             client_session=ClientSession(user=self._client_session.user),
-            verify=self._http_session.verify)
+            verify=self._http_session.verify,
+        )
 
     @property
     def max_attempts(self) -> int:
@@ -661,7 +681,9 @@ class TrinoRequest:
     def next_uri(self) -> Optional[str]:
         return self._next_uri
 
-    def post(self, sql: str, additional_http_headers: Optional[Dict[str, Any]] = None) -> Response:
+    def post(
+        self, sql: str, additional_http_headers: Optional[Dict[str, Any]] = None
+    ) -> Response:
         data = sql.encode("utf-8")
         # Deep copy of the http_headers dict since they may be modified for this
         # request by the provided additional_http_headers
@@ -691,7 +713,9 @@ class TrinoRequest:
         return self._delete(url, timeout=self._request_timeout, proxies=PROXIES)
 
     @staticmethod
-    def _process_error(error, query_id: Optional[str]) -> Union[TrinoExternalError, TrinoQueryError, TrinoUserError]:
+    def _process_error(
+        error, query_id: Optional[str]
+    ) -> Union[TrinoExternalError, TrinoQueryError, TrinoUserError]:
         error_type = error["errorType"]
         if error_type == "EXTERNAL":
             raise exceptions.TrinoExternalError(error, query_id)
@@ -740,14 +764,18 @@ class TrinoRequest:
                 self._client_session.properties[key] = value
 
         if constants.HEADER_SET_CATALOG in http_response.headers:
-            self._client_session.catalog = http_response.headers[constants.HEADER_SET_CATALOG]
+            self._client_session.catalog = http_response.headers[
+                constants.HEADER_SET_CATALOG
+            ]
 
         if constants.HEADER_SET_SCHEMA in http_response.headers:
-            self._client_session.schema = http_response.headers[constants.HEADER_SET_SCHEMA]
+            self._client_session.schema = http_response.headers[
+                constants.HEADER_SET_SCHEMA
+            ]
 
         if constants.HEADER_SET_ROLE in http_response.headers:
             for key, value in get_roles_values(
-                    http_response.headers, constants.HEADER_SET_ROLE
+                http_response.headers, constants.HEADER_SET_ROLE
             ):
                 self._client_session.roles[key] = value
 
@@ -764,7 +792,9 @@ class TrinoRequest:
                 self._client_session.prepared_statements.pop(name, None)
 
         if constants.HEADER_SET_AUTHORIZATION_USER in http_response.headers:
-            self._client_session.authorization_user = http_response.headers[constants.HEADER_SET_AUTHORIZATION_USER]
+            self._client_session.authorization_user = http_response.headers[
+                constants.HEADER_SET_AUTHORIZATION_USER
+            ]
 
         if constants.HEADER_RESET_AUTHORIZATION_USER in http_response.headers:
             self._client_session.authorization_user = None
@@ -793,12 +823,16 @@ class TrinoRequest:
         key = header[0]
 
         if not _HEADER_EXTRA_CREDENTIAL_KEY_REGEX.match(key):
-            raise ValueError(f"whitespace or '=' are disallowed in extra credential '{key}'")
+            raise ValueError(
+                f"whitespace or '=' are disallowed in extra credential '{key}'"
+            )
 
         try:
-            key.encode().decode('ascii')
+            key.encode().decode("ascii")
         except UnicodeDecodeError:
-            raise ValueError(f"only ASCII characters are allowed in extra credential '{key}'")
+            raise ValueError(
+                f"only ASCII characters are allowed in extra credential '{key}'"
+            )
 
 
 class TrinoResult:
@@ -843,11 +877,12 @@ class TrinoQuery:
     """Represent the execution of a SQL statement by Trino."""
 
     def __init__(
-            self,
-            request: TrinoRequest,
-            query: str,
-            legacy_primitive_types: bool = False,
-            fetch_mode: Literal["mapped", "segments"] = "mapped"
+        self,
+        request: TrinoRequest,
+        query: str,
+        legacy_primitive_types: bool = False,
+        fetch_mode: Literal["mapped", "segments", "prefetching"] = "mapped",
+        max_prefetch_rows: int = 1_000_000,
     ) -> None:
         self._query_id: Optional[str] = None
         self._stats: Dict[Any, Any] = {}
@@ -865,6 +900,7 @@ class TrinoQuery:
         self._legacy_primitive_types = legacy_primitive_types
         self._row_mapper: Optional[RowMapper] = None
         self._fetch_mode = fetch_mode
+        self._max_prefetch_rows = max_prefetch_rows
 
     @property
     def query_id(self) -> Optional[str]:
@@ -935,7 +971,9 @@ class TrinoQuery:
         try:
             response = self._request.post(self._query, additional_http_headers)
         except requests.exceptions.RequestException as e:
-            raise trino.exceptions.TrinoConnectionError("failed to execute: {}".format(e))
+            raise trino.exceptions.TrinoConnectionError(
+                "failed to execute: {}".format(e)
+            )
         status = self._request.process(response)
         self._info_uri = status.info_uri
         self._query_id = status.id
@@ -976,8 +1014,10 @@ class TrinoQuery:
         self._update_count = status.update_count
         self._next_uri = status.next_uri
         if not self._row_mapper and status.columns:
-            self._row_mapper = RowMapperFactory().create(columns=status.columns,
-                                                         legacy_primitive_types=self._legacy_primitive_types)
+            self._row_mapper = RowMapperFactory().create(
+                columns=status.columns,
+                legacy_primitive_types=self._legacy_primitive_types,
+            )
         if status.columns:
             self._columns = status.columns
 
@@ -1002,6 +1042,10 @@ class TrinoQuery:
             spooled = self._to_segments(rows)
             if self._fetch_mode == "segments":
                 return spooled
+            if self._fetch_mode == "prefetching":
+                return PrefetchingSegmentIterator(
+                    spooled, self._row_mapper, self._max_prefetch_rows
+                )
             # Return iterator directly, do NOT materialize with list()
             return SegmentIterator(spooled, self._row_mapper)
         elif isinstance(status.rows, list):
@@ -1020,11 +1064,15 @@ class TrinoQuery:
                 segments.append(InlineSegment(inline_segment))
             elif segment_type == SegmentType.SPOOLED:
                 spooled_segment = cast(_SpooledSegmentTO, segment)
-                segments.append(SpooledSegment(spooled_segment, self._request.unauthenticated()))
+                segments.append(
+                    SpooledSegment(spooled_segment, self._request.unauthenticated())
+                )
             else:
                 raise ValueError(f"Unsupported segment type: {segment_type}")
 
-        return list(map(lambda segment: DecodableSegment(encoding, metadata, segment), segments))
+        return list(
+            map(lambda segment: DecodableSegment(encoding, metadata, segment), segments)
+        )
 
     def cancel(self) -> None:
         """Cancel the current query"""
@@ -1035,7 +1083,9 @@ class TrinoQuery:
         try:
             response = self._request.delete(self._next_uri)
         except requests.exceptions.RequestException as e:
-            raise trino.exceptions.TrinoConnectionError("failed to cancel query: {}".format(e))
+            raise trino.exceptions.TrinoConnectionError(
+                "failed to cancel query: {}".format(e)
+            )
         if response.status_code == requests.codes.no_content:
             self._cancelled = True
             logger.debug("query cancelled: %s", self.query_id)
@@ -1045,7 +1095,10 @@ class TrinoQuery:
 
     def is_finished(self) -> bool:
         import warnings
-        warnings.warn("is_finished is deprecated, use finished instead", DeprecationWarning)
+
+        warnings.warn(
+            "is_finished is deprecated, use finished instead", DeprecationWarning
+        )
         return self.finished
 
     @property
@@ -1067,8 +1120,13 @@ def _retry_with(handle_retry, handled_exceptions, conditions, max_attempts):
                 try:
                     result = func(*args, **kwargs)
                     if any(guard(result) for guard in conditions):
-                        if result.status_code == 429 and "Retry-After" in result.headers:
-                            retry_after = _parse_retry_after_header(result.headers.get("Retry-After"))
+                        if (
+                            result.status_code == 429
+                            and "Retry-After" in result.headers
+                        ):
+                            retry_after = _parse_retry_after_header(
+                                result.headers.get("Retry-After")
+                            )
                             handle_retry_sleep = _RetryAfterSleep(retry_after)
                             handle_retry_sleep.retry()
                         else:
@@ -1131,6 +1189,7 @@ class _InlineSegmentTO(_SegmentTO):
 
 class SegmentType(str, Enum):
     """Enum with string values that can be compared to strings."""
+
     INLINE = "inline"
     SPOOLED = "spooled"
 
@@ -1143,6 +1202,7 @@ class Segment(abc.ABC):
         metadata (property): Metadata associated with the segment.
         rows (property): Returns the decoded and mapped data.
     """
+
     def __init__(self, segment: _SegmentTO) -> None:
         self._segment = segment
 
@@ -1164,6 +1224,7 @@ class InlineSegment(Segment):
     Attributes:
         rows (property): The data in the segment, decoded and mapped from the base64 encoded data.
     """
+
     def __init__(self, segment: _InlineSegmentTO) -> None:
         super().__init__(segment)
         self._segment = cast(_InlineSegmentTO, segment)
@@ -1191,6 +1252,7 @@ class SpooledSegment(Segment):
     Methods:
         acknowledge(): Sends an acknowledgment request for the segment.
     """
+
     def __init__(
         self,
         segment: _SpooledSegmentTO,
@@ -1226,7 +1288,10 @@ class SpooledSegment(Segment):
                 if not http_response.ok:
                     self._request.raise_response_error(http_response)
             except Exception as e:
-                logger.error(f"Failed to acknowledge spooling request for segment {self}: {e}")
+                logger.error(
+                    f"Failed to acknowledge spooling request for segment {self}: {e}"
+                )
+
         # Start the acknowledgment in the executor thread
         executor.submit(acknowledge_request)
 
@@ -1239,9 +1304,7 @@ class SpooledSegment(Segment):
         return self._request._get(uri, headers=headers_with_single_value, **kwargs)
 
     def __repr__(self):
-        return (
-            f"SpooledSegment(metadata={self.metadata})"
-        )
+        return f"SpooledSegment(metadata={self.metadata})"
 
 
 class DecodableSegment:
@@ -1253,7 +1316,10 @@ class DecodableSegment:
         metadata (_SegmentMetadataTO): Metadata for all segments in the query
         segment (Segment): The spooled segment data
     """
-    def __init__(self, encoding: str, metadata: _SegmentMetadataTO, segment: Segment) -> None:
+
+    def __init__(
+        self, encoding: str, metadata: _SegmentMetadataTO, segment: Segment
+    ) -> None:
         self._encoding = encoding
         self._metadata = metadata
         self._segment = segment
@@ -1271,11 +1337,15 @@ class DecodableSegment:
         return self._metadata
 
     def __repr__(self):
-        return (f"DecodableSegment(encoding={self._encoding}, metadata={self._metadata}, segment={self._segment})")
+        return f"DecodableSegment(encoding={self._encoding}, metadata={self._metadata}, segment={self._segment})"
 
 
 class SegmentIterator:
-    def __init__(self, segments: Union[DecodableSegment, List[DecodableSegment]], mapper: RowMapper) -> None:
+    def __init__(
+        self,
+        segments: Union[DecodableSegment, List[DecodableSegment]],
+        mapper: RowMapper,
+    ) -> None:
         self._segments = iter(segments if isinstance(segments, List) else [segments])
         self._mapper = mapper
         self._decoder = None
@@ -1305,14 +1375,103 @@ class SegmentIterator:
 
             self._current_segment = next(self._segments)
             if self._decoder is None:
-                self._decoder = SegmentDecoder(CompressedQueryDataDecoderFactory(self._mapper)
-                                               .create(self._current_segment.encoding))
+                self._decoder = SegmentDecoder(
+                    CompressedQueryDataDecoderFactory(self._mapper).create(
+                        self._current_segment.encoding
+                    )
+                )
             self._rows = iter(self._decoder.decode(self._current_segment.segment))
         except StopIteration:
             self._finished = True
 
 
-class SegmentDecoder():
+class PrefetchingSegmentIterator:
+    """
+    Iterates over segments with parallel prefetching of upcoming segments.
+
+    Submits decode tasks (HTTP fetch + decompress + deserialize) to a thread pool
+    while the caller consumes the current segment, overlapping I/O with processing.
+
+    Concurrency is bounded by two independent limits:
+    - At most ``_prefetch_executor._max_workers`` fetches run concurrently (caps
+      in-flight HTTP requests).
+    - At most ``max_prefetch_rows`` decoded rows are held in memory across all
+      completed-but-unconsumed futures (caps memory pressure). This is a soft
+      limit: the initial burst can reach ``max_workers * rows_per_segment`` before
+      any future completes and the count becomes known.
+
+    ``_buffered_row_count`` is incremented inside the worker thread immediately
+    after decoding (rows physically in memory) and decremented on the main thread
+    when a future is popped for consumption. A lock guards cross-thread updates.
+
+    Acknowledgement of spooled segments is sent from the worker thread right after
+    the segment data has been fetched and decoded, which is the earliest correct
+    moment and avoids tracking the previous segment on the main thread.
+    """
+
+    def __init__(
+        self,
+        segments: List[DecodableSegment],
+        mapper: RowMapper,
+        max_prefetch_rows: int = 1_000_000,
+    ) -> None:
+        self._segments: Iterator[DecodableSegment] = iter(segments)
+        self._mapper = mapper
+        self._max_prefetch_rows = max_prefetch_rows
+        self._pending: deque = (
+            deque()
+        )  # deque of Future[Tuple[List[rows], DecodableSegment]]
+        self._buffered_row_count = 0
+        self._lock = threading.Lock()
+        self._current_rows: Iterator[List[Any]] = iter([])
+        self._exhausted = False
+        self._fill_prefetch_queue()
+
+    def _fetch_and_decode(
+        self, decodable: DecodableSegment
+    ) -> Tuple[List[List[Any]], DecodableSegment]:
+        decoder = SegmentDecoder(
+            CompressedQueryDataDecoderFactory(self._mapper).create(decodable.encoding)
+        )
+        rows = decoder.decode(decodable.segment)
+        if isinstance(decodable.segment, SpooledSegment):
+            decodable.segment.acknowledge()
+        with self._lock:
+            self._buffered_row_count += len(rows)
+        return rows, decodable
+
+    def _fill_prefetch_queue(self) -> None:
+        max_in_flight = _prefetch_executor._max_workers
+        while not self._exhausted and len(self._pending) < max_in_flight:
+            with self._lock:
+                if self._buffered_row_count >= self._max_prefetch_rows:
+                    break
+            try:
+                segment = next(self._segments)
+                self._pending.append(
+                    _prefetch_executor.submit(self._fetch_and_decode, segment)
+                )
+            except StopIteration:
+                self._exhausted = True
+
+    def __iter__(self) -> Iterator[List[Any]]:
+        return self
+
+    def __next__(self) -> List[Any]:
+        while True:
+            try:
+                return next(self._current_rows)
+            except StopIteration:
+                if not self._pending:
+                    raise StopIteration
+                rows, _ = self._pending.popleft().result()
+                with self._lock:
+                    self._buffered_row_count -= len(rows)
+                self._current_rows = iter(rows)
+                self._fill_prefetch_queue()
+
+
+class SegmentDecoder:
     def __init__(self, decoder: QueryDataDecoder):
         self._decoder = decoder
 
@@ -1327,7 +1486,7 @@ class SegmentDecoder():
             raise ValueError(f"Unsupported segment type: {type(segment)}")
 
 
-class CompressedQueryDataDecoderFactory():
+class CompressedQueryDataDecoderFactory:
     def __init__(self, mapper: RowMapper) -> None:
         self._mapper = mapper
 
@@ -1380,7 +1539,9 @@ class CompressedQueryDataDecoder(QueryDataDecoder):
         # Data is compressed
         expected_compressed_size = metadata["segmentSize"]
         if not len(data) == expected_compressed_size:
-            raise RuntimeError(f"Expected to read {expected_compressed_size} bytes but got {len(data)}")
+            raise RuntimeError(
+                f"Expected to read {expected_compressed_size} bytes but got {len(data)}"
+            )
         decompressed_data = self.decompress(data, metadata)
         expected_uncompressed_size = metadata["uncompressedSize"]
         if not len(decompressed_data) == expected_uncompressed_size:
@@ -1405,5 +1566,7 @@ class ZStdQueryDataDecoder(CompressedQueryDataDecoder):
 class Lz4QueryDataDecoder(CompressedQueryDataDecoder):
     def decompress(self, data: bytes, metadata: _SegmentMetadataTO) -> bytes:
         expected_uncompressed_size = metadata["uncompressedSize"]
-        decoded_bytes = lz4.block.decompress(data, uncompressed_size=int(expected_uncompressed_size))
+        decoded_bytes = lz4.block.decompress(
+            data, uncompressed_size=int(expected_uncompressed_size)
+        )
         return decoded_bytes
