@@ -104,7 +104,7 @@ __all__ = [
 
 logger = trino.logging.get_logger(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
-_prefetch_executor = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) + 4))
+_prefetch_executor = ThreadPoolExecutor(max_workers=50)
 
 
 def close_executor():
